@@ -2,6 +2,3 @@ node_modules/
 npm-debug.log*
 *.tgz
 .DS_Store
-
-# vhs scratch frames (e.g. docs/_check.png) — the committed artifact is docs/demo.gif
-docs/_*.png
