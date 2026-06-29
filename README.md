@@ -5,7 +5,7 @@ download, and upload using [fast.com](https://fast.com) (Netflix) and shows it
 all on a live, animated display.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/longsien/fast/main/docs/demo.gif"
+  <img src="https://raw.githubusercontent.com/longsien/fastdotcom/main/docs/demo.gif"
        alt="fast running in a terminal: ping, then download and upload gauges filling live"
        width="760">
 </p>

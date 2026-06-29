@@ -14,7 +14,7 @@
 #
 class Fast < Formula
   desc "Tiny zero-dependency CLI speedtest using fast.com (Netflix) with a live TUI"
-  homepage "https://github.com/longsien/fast"
+  homepage "https://github.com/longsien/fastdotcom"
   url "https://registry.npmjs.org/fastdotcom/-/fastdotcom-0.1.0.tgz"
   sha256 "REPLACE_WITH_TARBALL_SHA256" # see the curl one-liner above
   license "MIT"

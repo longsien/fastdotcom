@@ -35,10 +35,10 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/longsien/fast.git"
+    "url": "git+https://github.com/longsien/fastdotcom.git"
   },
   "bugs": {
-    "url": "https://github.com/longsien/fast/issues"
+    "url": "https://github.com/longsien/fastdotcom/issues"
   },
-  "homepage": "https://github.com/longsien/fast#readme"
+  "homepage": "https://github.com/longsien/fastdotcom#readme"
 }
