@@ -1,0 +1,44 @@
+{
+  "name": "fastdotcom",
+  "version": "0.1.0",
+  "description": "A tiny zero-dependency CLI that measures your connection speed using fast.com (Netflix) as its backend, with a btop-style live TUI.",
+  "bin": {
+    "fast": "index.js"
+  },
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "index.js"
+  ],
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --test"
+  },
+  "keywords": [
+    "speedtest",
+    "speed-test",
+    "fast.com",
+    "netflix",
+    "bandwidth",
+    "internet-speed",
+    "download",
+    "upload",
+    "latency",
+    "ping",
+    "cli",
+    "tui",
+    "network"
+  ],
+  "author": "Long Sien <longsien@gmail.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/longsien/fast.git"
+  },
+  "bugs": {
+    "url": "https://github.com/longsien/fast/issues"
+  },
+  "homepage": "https://github.com/longsien/fast#readme"
+}
