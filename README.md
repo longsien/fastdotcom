@@ -1,8 +1,6 @@
 # fast
 
-Check your internet speed from the terminal. `fast` measures your ping,
-download, and upload using [fast.com](https://fast.com) (Netflix) and shows it
-all on a live, animated display.
+CLI tool to test your internet speed using fast.com (Netflix).
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/longsien/fastdotcom/main/docs/demo.gif"
