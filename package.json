@@ -1,7 +1,7 @@
 {
   "name": "fastdotcom",
-  "version": "1.0.0",
-  "description": "A tiny zero-dependency CLI that measures your connection speed using fast.com (Netflix) as its backend, with a btop-style live TUI.",
+  "version": "1.1.0",
+  "description": "A speedtest tool that uses fast.com (Netflix) as its backend.",
   "bin": {
     "fast": "index.js"
   },

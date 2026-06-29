@@ -85,12 +85,12 @@ test('gaugeStats renders an empty track when there is no data', () => {
   assert.equal(countDots(gaugeStats(stats([0]), 20, G, 0)), 20);
 });
 
-test('gaugeStats fill grows with the average relative to scaleMax', () => {
-  const lo = stats([10]); // avg 10
-  const hi = stats([90]); // avg 90
+test('gaugeStats fill grows with the p90 relative to scaleMax', () => {
+  const lo = stats([10]); // p90 10
+  const hi = stats([90]); // p90 90
   const scale = 100;
   // Unfilled cells are the dim track colour C_TRACK = fg(48,52,64). A higher
-  // average fills more of the bar, leaving fewer track cells behind.
+  // p90 fills more of the bar, leaving fewer track cells behind.
   const trackCells = (s) => (s.match(/\x1b\[38;2;48;52;64m/g) || []).length;
   assert.ok(trackCells(gaugeStats(hi, 40, G, scale)) < trackCells(gaugeStats(lo, 40, G, scale)));
 });

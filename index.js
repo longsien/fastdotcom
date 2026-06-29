@@ -5,9 +5,9 @@
 // Open Connect) as its backend. Zero dependencies.
 //
 // On a TTY it renders a small btop-style TUI: each metric is a gauge scaled
-// 0 → max (this run), gradient-filled to the average, with a white tick at the
-// minimum and superscript min/avg/max labels above. Piped (or --json) output
-// falls back to plain text.
+// 0 → max (this run), gradient-filled to the 90th percentile, with a white tick
+// at the minimum and superscript min/p90/max labels above. Piped (or --json)
+// output falls back to plain text.
 
 const https = require('node:https');
 
@@ -69,31 +69,108 @@ const BOLD = '\x1b[1m';
 const fg = (r, g, b) => `\x1b[38;2;${r};${g};${b}m`;
 const visLen = (s) => s.replace(/\x1b\[[0-9;]*m/g, '').length; // width sans ANSI
 
-const C_BORDER = fg(88, 96, 112);
-const C_TITLE = fg(122, 222, 255);
-const C_LABEL = fg(210, 215, 225);
-const C_MUTE = fg(120, 128, 145);
-const C_TRACK = fg(48, 52, 64);
-const C_TICK = BOLD + fg(255, 255, 255); // the min marker (bright dot)
-const C_MAXTICK = fg(96, 104, 122); // the max marker (slightly lighter than track)
+// Query the terminal for its background colour via OSC 11.  Returns true if
+// the background is light, false if dark (or on detection failure).
+async function detectLightBg() {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) return false;
+  return new Promise((resolve) => {
+    const stdin = process.stdin;
+    const prevRaw = stdin.isRaw;
+    stdin.setRawMode(true);
+    stdin.resume();
 
-// Border shimmer: while a measurement runs, a soft band of lighter grey sweeps
-// left→right across the whole box outline (corners, dashes and vertical bars),
-// and through the muted header/footer text.
-const SHIMMER_BASE = [88, 96, 112]; // C_BORDER grey (resting colour)
-const SHIMMER_GLOW = [165, 176, 198]; // a clear lift over base as the band passes
-const SHIMMER_EDGE = 0.4; // dim factor for the vertical edges (a whole column
-//                           lights at once, so full glow reads as a flash)
-const SHIMMER_TEXT = [120, 128, 145]; // muted text resting colour (C_MUTE)
-const SHIMMER_TEXT_GLOW = [185, 192, 208]; // brightened muted text as the band passes
+    let buf = '';
+    let settled = false;
+    const onData = (chunk) => { buf += chunk.toString(); };
+    stdin.on('data', onData);
+
+    // Send OSC 11 query (request background colour).
+    process.stdout.write('\x1b]11;?\x07');
+
+    const done = (light) => {
+      if (settled) return;
+      settled = true;
+      clearInterval(poll);
+      clearTimeout(timer);
+      stdin.removeListener('data', onData);
+      stdin.setRawMode(prevRaw);
+      stdin.pause();
+      resolve(light);
+    };
+
+    const check = () => {
+      const m = buf.match(/\x1b\]11;rgb:([0-9a-f]{1,4})\/([0-9a-f]{1,4})\/([0-9a-f]{1,4})/i);
+      if (m) {
+        const r = parseInt(m[1], 16) >> (m[1].length > 2 ? 8 : 0);
+        const g = parseInt(m[2], 16) >> (m[2].length > 2 ? 8 : 0);
+        const b = parseInt(m[3], 16) >> (m[3].length > 2 ? 8 : 0);
+        done(0.299 * r + 0.587 * g + 0.114 * b > 128);
+      }
+    };
+    const poll = setInterval(check, 10);
+    const timer = setTimeout(() => done(false), 150);
+  });
+}
+
+// Palette: switch colours depending on detected background.
+const DARK = {
+  border: [88, 96, 112],
+  title: [122, 222, 255],
+  label: [210, 215, 225],
+  mute: [120, 128, 145],
+  track: [48, 52, 64],
+  tick: [255, 255, 255],
+  maxtick: [96, 104, 122],
+  shimmerBase: [88, 96, 112],
+  shimmerGlow: [165, 176, 198],
+  shimmerText: [120, 128, 145],
+  shimmerTextGlow: [185, 192, 208],
+  gPing: [[52, 211, 153], [250, 204, 21], [239, 68, 68]],
+  gDown: [[196, 181, 253], [167, 139, 250], [139, 92, 246]],
+  gUp: [[249, 168, 212], [244, 114, 182], [236, 72, 153]],
+};
+
+// Night Owl Light — terminal palette from Sarah Drasner's VS Code theme.
+const LIGHT = {
+  border:    [147, 161, 161], // white   — muted, recedes
+  title:     [40, 142, 215],  // blue    — #288ed7, the signature accent
+  label:     [64, 63, 83],    // fg      — #403f53, main foreground
+  mute:      [147, 161, 161], // white   — #93A1A1, subdued
+  track:     [230, 230, 230], // between bg #F6F6F6 and selection #E0E0E0
+  tick:      [64, 63, 83],    // fg      — #403f53, strong contrast
+  maxtick:   [180, 185, 190], // subtle in the track
+  shimmerBase:     [147, 161, 161], // white resting
+  shimmerGlow:     [90, 95, 110],  // darken toward fg
+  shimmerText:     [147, 161, 161], // white resting
+  shimmerTextGlow: [90, 95, 110],  // darken toward fg
+  gPing: [[8, 145, 106], [224, 175, 2], [222, 61, 59]], // green→yellow→red
+  gDown: [[42, 162, 152], [40, 142, 215], [214, 67, 138]], // cyan→blue→magenta
+  gUp:   [[224, 175, 2], [214, 67, 138], [222, 61, 59]], // yellow→magenta→red
+};
+
+let T; // active theme — set by initTheme()
+
+function theme(light) {
+  T = light ? LIGHT : DARK;
+}
+theme(false); // default dark; initTheme() overrides before first paint
+
+function C_BORDER() { return fg(...T.border); }
+function C_TITLE() { return fg(...T.title); }
+function C_LABEL() { return fg(...T.label); }
+function C_MUTE() { return fg(...T.mute); }
+function C_TRACK() { return fg(...T.track); }
+function C_TICK() { return BOLD + fg(...T.tick); }
+function C_MAXTICK() { return fg(...T.maxtick); }
+
+const SHIMMER_EDGE = 0.4;
 
 // Gradient stops (left → right across a gauge).
-// Bars are scaled 0→max, so a full bar means avg≈max (a consistent reading);
-// gradients end green/cool so "fuller = healthier" reads the same everywhere.
-const G_PING = [[52, 211, 153], [250, 204, 21], [239, 68, 68]]; // green=low → red=high
 const PING_SCALE = 150; // ms mapped to the full green→red range
-const G_DOWN = [[196, 181, 253], [167, 139, 250], [139, 92, 246]]; // lilac→violet
-const G_UP = [[249, 168, 212], [244, 114, 182], [236, 72, 153]]; // pink→rose
+
+function G_PING() { return T.gPing; }
+function G_DOWN() { return T.gDown; }
+function G_UP() { return T.gUp; }
 
 function gradColor(stops, t) {
   t = Math.max(0, Math.min(1, t));
@@ -115,27 +192,27 @@ function clampIdx(frac, width) {
   return Math.max(0, Math.min(width - 1, Math.round(frac * width)));
 }
 
-// A gauge of `width` columns scaled 0 → scaleMax: gradient-filled to st.avg,
+// A gauge of `width` columns scaled 0 → scaleMax: gradient-filled to st.p90,
 // with a white tick at st.min; the rest is a dim track. Download and upload
 // pass a shared scaleMax so their bars are directly comparable.
 function gaugeStats(st, width, stops, scaleMax) {
   const max = scaleMax || (st && st.max) || 0;
-  if (!st || max <= 0) return C_TRACK + DOT.repeat(width) + RESET;
-  const fill = Math.round(Math.min(1, st.avg / max) * width);
+  if (!st || max <= 0) return C_TRACK() + DOT.repeat(width) + RESET;
+  const fill = Math.round(Math.min(1, st.p90 / max) * width);
   const minIdx = clampIdx(Math.min(1, st.min / max), width);
   const maxIdx = clampIdx(Math.min(1, st.max / max), width);
   let out = '';
   for (let i = 0; i < width; i++) {
     if (i === minIdx) {
-      out += C_TICK + DOT; // bright min marker
+      out += C_TICK() + DOT; // bright min marker
     } else if (i < fill) {
       const t = width > 1 ? i / (width - 1) : 0;
       const [r, g, b] = gradColor(stops, t);
       out += fg(r, g, b) + DOT;
     } else if (i === maxIdx) {
-      out += C_MAXTICK + DOT; // faint max marker in the track
+      out += C_MAXTICK() + DOT; // faint max marker in the track
     } else {
-      out += C_TRACK + DOT;
+      out += C_TRACK() + DOT;
     }
   }
   return out + RESET;
@@ -191,24 +268,24 @@ function placeLabels(cells, items, gap = 1) {
   }
 }
 
-// The min/avg/max superscript row that sits above a gauge, positioned on the
+// The min/p90/max superscript row that sits above a gauge, positioned on the
 // shared scaleMax.
 function labelRow(st, width, stops, fmtSup, scaleMax) {
   const cells = newCells(width);
   const max = scaleMax || (st && st.max) || 0;
   if (st && max > 0) {
-    const avgF = Math.min(1, st.avg / max);
-    const [r, g, b] = gradColor(stops, avgF);
+    const p90F = Math.min(1, st.p90 / max);
+    const [r, g, b] = gradColor(stops, p90F);
     // The gradient fills columns 0…fill-1, so the bar visually ends at fill-1.
-    // min/max have ticks drawn at their clampIdx column; avg has none, so anchor
+    // min/max have ticks drawn at their clampIdx column; p90 has none, so anchor
     // it to the last filled dot rather than the first empty cell past it.
-    const avgIdx = Math.max(0, Math.round(avgF * width) - 1);
+    const p90Idx = Math.max(0, Math.round(p90F * width) - 1);
     placeLabels(cells, [
-      // Each label's right edge sits on its own marker (min tick, avg fill end,
+      // Each label's right edge sits on its own marker (min tick, p90 fill end,
       // max tick); placeLabels nudges them apart only if they crowd.
-      { text: fmtSup(st.min), anchor: clampIdx(Math.min(1, st.min / max), width), align: 'right', color: C_TICK },
-      { text: fmtSup(st.avg), anchor: avgIdx, align: 'right', color: BOLD + fg(r, g, b) },
-      { text: fmtSup(st.max), anchor: clampIdx(Math.min(1, st.max / max), width), align: 'right', color: C_MUTE },
+      { text: fmtSup(st.min), anchor: clampIdx(Math.min(1, st.min / max), width), align: 'right', color: C_TICK() },
+      { text: fmtSup(st.p90), anchor: p90Idx, align: 'right', color: BOLD + fg(r, g, b) },
+      { text: fmtSup(st.max), anchor: clampIdx(Math.min(1, st.max / max), width), align: 'right', color: C_MUTE() },
     ]);
   }
   return renderCells(cells);
@@ -534,7 +611,7 @@ function makeTui(doUpload) {
   // Border cell colour. `gain` dims the sweep — the vertical edges pass < 1 so
   // the whole column lighting at once doesn't read as a flash.
   const borderColor = (col, gain = 1) =>
-    mix(SHIMMER_BASE, SHIMMER_GLOW, sweepK(col) * gain);
+    mix(T.shimmerBase, T.shimmerGlow, sweepK(col) * gain);
 
   // A run of `count` identical border chars from column `startCol`, swept.
   function borderRun(ch, count, startCol) {
@@ -547,7 +624,7 @@ function makeTui(doUpload) {
   function sweptText(text, startCol) {
     let s = '';
     for (let i = 0; i < text.length; i++)
-      s += mix(SHIMMER_TEXT, SHIMMER_TEXT_GLOW, sweepK(startCol + i)) + text[i];
+      s += mix(T.shimmerText, T.shimmerTextGlow, sweepK(startCol + i)) + text[i];
     return s + RESET;
   }
 
@@ -562,7 +639,7 @@ function makeTui(doUpload) {
     const dashes = Math.max(0, inner - visLen(lt) - visLen(rt));
     return (
       borderColor(0, SHIMMER_EDGE) + left + RESET +
-      (lt ? C_TITLE + BOLD + lt + RESET : '') +
+      (lt ? C_TITLE() + BOLD + lt + RESET : '') +
       borderRun('─', dashes, 1 + visLen(lt)) +
       (rt ? sweptText(rt, W - 1 - visLen(rt)) : '') +
       borderColor(W - 1, SHIMMER_EDGE) + right + RESET
@@ -579,17 +656,17 @@ function makeTui(doUpload) {
     const st = state.pingStats;
     const active = state.phase === 'ping';
     const cells = newCells(body);
-    place(cells, pad('PING', labelW), 0, 'left', active ? C_TICK : st ? BOLD + C_LABEL : C_MUTE);
+    place(cells, pad('PING', labelW), 0, 'left', active ? C_TICK() : st ? BOLD + C_LABEL() : C_MUTE());
     if (st) {
       // Colour the latency by value: green (low) → red (high).
-      const [r, g, b] = gradColor(G_PING, st.avg / PING_SCALE);
+      const [r, g, b] = gradColor(G_PING(), st.avg / PING_SCALE);
       place(cells, fmtMs(st.avg), labelW + 1, 'left', BOLD + fg(r, g, b));
       const spread =
         `${st.min.toFixed(0)} / ${st.max.toFixed(0)} ms` +
         (state.jitter != null ? `  ±${state.jitter.toFixed(1)}` : '');
-      place(cells, spread, body - 1, 'right', C_MUTE);
+      place(cells, spread, body - 1, 'right', C_MUTE());
     } else {
-      place(cells, 'measuring…', labelW + 1, 'left', C_MUTE);
+      place(cells, 'measuring…', labelW + 1, 'left', C_MUTE());
     }
     return wrap(renderCells(cells));
   }
@@ -598,12 +675,12 @@ function makeTui(doUpload) {
   function metricBlock(key, label, st, stops, scaleMax, note) {
     const active = state.phase === key;
     const lab =
-      (active ? C_TICK : st ? BOLD + C_LABEL : C_MUTE) + pad(label, labelW) + RESET;
+      (active ? C_TICK() : st ? BOLD + C_LABEL() : C_MUTE()) + pad(label, labelW) + RESET;
 
     let labels;
     if (note && !st) {
       const cells = newCells(barW);
-      place(cells, note, barW >> 1, 'center', C_MUTE);
+      place(cells, note, barW >> 1, 'center', C_MUTE());
       labels = renderCells(cells);
     } else {
       labels = labelRow(st, barW, stops, supSpeed, scaleMax);
@@ -620,9 +697,12 @@ function makeTui(doUpload) {
   // A long IP (IPv6 is up to 39 chars) can't share the bottom border with the
   // download/upload summary, so past this length it drops to its own dimmed,
   // right-aligned caption line just under the box instead of crowding them out.
-  const IP_IN_BORDER_MAX = 15; // longest IPv4 ("255.255.255.255")
+  // Available space for IP in the bottom border: total inner width minus the
+  // peak summary (roughly 30-40 chars depending on speeds), some padding, and
+  // a minimum run of dashes for visual breathing room.
+  function ipInBorderMax() { return Math.max(15, inner - 45); }
   function ipCaption(text) {
-    return ' '.repeat(Math.max(0, W - text.length)) + C_MUTE + text + RESET;
+    return ' '.repeat(Math.max(0, W - text.length)) + C_MUTE() + text + RESET;
   }
 
   function buildFrame() {
@@ -631,7 +711,7 @@ function makeTui(doUpload) {
       ? [m.colo, m.country].filter(Boolean).join(' · ') || state.provider || ''
       : 'connecting…';
     const ipText = m && m.clientIp ? m.clientIp : '';
-    const ipInBorder = ipText.length <= IP_IN_BORDER_MAX;
+    const ipInBorder = ipText.length <= ipInBorderMax();
 
     // Shared scale: the larger peak of download/upload = a full bar.
     const scaleMax = Math.max(
@@ -647,17 +727,17 @@ function makeTui(doUpload) {
       blank(),
       pingLine(),
       blank(),
-      ...metricBlock('down', 'DOWN', state.downStats, G_DOWN, scaleMax),
+      ...metricBlock('down', 'DOWN', state.downStats, G_DOWN(), scaleMax),
       ...metricBlock(
         'up',
         'UP',
         state.doUpload ? state.upStats : null,
-        G_UP,
+        G_UP(),
         scaleMax,
         !state.doUpload ? 'skipped' : state.upUnavailable ? 'n/a on fast.com' : undefined
       ),
       blank(),
-      borderLine('╰', '╯', peakSummary(), ipInBorder ? ipText : ''),
+      borderLine('╰', '╯', peakSummary(scaleMax), ipInBorder ? ipText : ''),
     ];
     if (ipText && !ipInBorder) lines.push(ipCaption(ipText));
     return lines;
@@ -665,14 +745,18 @@ function makeTui(doUpload) {
 
   // Footer summary: each stream's headline speed (90th percentile, near the
   // sustained peak — how speed tests usually report), coloured to match its
-  // bar's gradient.
-  function peakSummary() {
-    const seg = (stops, text) => BOLD + fg(...gradColor(stops, 0.5)) + text + RESET;
+  // bar's gradient at the p90 fill point.
+  function peakSummary(scaleMax) {
+    const max = scaleMax || 1;
+    const seg = (stops, p90, text) => {
+      const t = Math.min(1, p90 / max);
+      return BOLD + fg(...gradColor(stops, t)) + text + RESET;
+    };
     const parts = [];
     if (state.downStats?.p90 > 0)
-      parts.push(seg(G_DOWN, `DOWN ${fmtBits(state.downStats.p90)}`));
+      parts.push(seg(G_DOWN(), state.downStats.p90, `DOWN ${fmtBits(state.downStats.p90)}`));
     if (state.doUpload && state.upStats?.p90 > 0)
-      parts.push(seg(G_UP, `UP ${state.uploadApprox ? '~' : ''}${fmtBits(state.upStats.p90)}`));
+      parts.push(seg(G_UP(), state.upStats.p90, `UP ${state.uploadApprox ? '~' : ''}${fmtBits(state.upStats.p90)}`));
     return parts.join('   ');
   }
 
@@ -728,6 +812,8 @@ function makeTui(doUpload) {
 }
 
 async function runTui(opts) {
+  const light = await detectLightBg();
+  theme(light);
   const tui = makeTui(opts.upload);
   const session = makeSession();
   let interrupted = false;
@@ -874,8 +960,9 @@ Usage:
   fast [options]
 
 Download and upload share one scale (the run's peak = a full bar) so they're
-directly comparable; each bar is filled to its average, with a white tick at
-the minimum and superscript min/avg/max above. Ping is shown as a number.
+directly comparable; each bar is filled to its 90th percentile (sustained
+peak), with a white tick at the minimum and superscript min/p90/max above.
+Ping is shown as a number.
 Upload uses a send-side measurement and reads on the high side (shown ~approx).
 
 Options:
