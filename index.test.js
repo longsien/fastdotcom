@@ -17,6 +17,8 @@ const {
   fmtMs,
   median,
   percentile,
+  rollingBps,
+  nextChunk,
 } = require('./index.js');
 
 // Visible width with ANSI escape sequences stripped (mirrors index.js).
@@ -65,6 +67,58 @@ test('stats returns min/avg/max/p90, or null when empty', () => {
   assert.equal(s.p90, 50);
   assert.equal(stats([]), null);
   assert.equal(stats(null), null);
+});
+
+test('rollingBps reports throughput over the trailing ~1s window', () => {
+  // Five 200ms windows (= 1s) each carrying 25 MB → one rolling sample.
+  const fine = Array.from({ length: 5 }, () => ({ bytes: 25e6, dur: 200 }));
+  const r = rollingBps(fine, 5);
+  assert.equal(r.length, 1); // one full 1s window available
+  assert.equal(r[0], (125e6 * 8) / 1); // 125 MB over 1s = 1 Gbps
+});
+
+test('rollingBps emits nothing until a full roll window exists', () => {
+  const fine = Array.from({ length: 3 }, () => ({ bytes: 10e6, dur: 200 }));
+  assert.deepEqual(rollingBps(fine, 5), []); // <5 windows → no sustained sample yet
+});
+
+test('rollingBps smooths a single-window burst far below the raw fine peak', () => {
+  const steady = { bytes: 10e6, dur: 200 }; // 400 Mbps fine window
+  const burst = { bytes: 30e6, dur: 200 }; // 1.2 Gbps fine window
+  const fine = [steady, steady, steady, steady, burst];
+  const r = rollingBps(fine, 5);
+  assert.equal(r.length, 1);
+  const rawBurstBps = (30e6 * 8) / 0.2; // 1.2 Gbps — what p90-of-200ms would latch onto
+  assert.ok(r[0] < rawBurstBps); // rolling window dilutes the burst
+  assert.equal(Math.round(r[0]), Math.round((70e6 * 8) / 1)); // 70 MB over 1s
+});
+
+test('rollingBps slides one full window per fine window once warmed', () => {
+  const fine = Array.from({ length: 8 }, () => ({ bytes: 5e6, dur: 200 }));
+  assert.equal(rollingBps(fine, 5).length, 4); // 8 - 5 + 1
+});
+
+test('nextChunk grows toward a ~1s request when the link outruns the size', () => {
+  const base = 26e6, cap = 256e6;
+  // 26MB delivered in 0.2s → 130 MB/s → a 1s request wants ~130MB.
+  const n = nextChunk(base, 26e6, 0.2, base, cap, 1);
+  assert.equal(n, 130e6);
+  assert.ok(n > base && n < cap);
+});
+
+test('nextChunk is grow-only: a slow completion never shrinks below the previous size', () => {
+  const base = 26e6, cap = 256e6;
+  assert.equal(nextChunk(base, 26e6, 3, base, cap, 1), base); // small "want" → hold base
+  assert.equal(nextChunk(100e6, 100e6, 5, base, cap, 1), 100e6); // hold a grown size too
+});
+
+test('nextChunk is capped for very fast links', () => {
+  const base = 26e6, cap = 256e6;
+  assert.equal(nextChunk(base, 26e6, 0.01, base, cap, 1), cap); // 2.6 GB/s → clamped
+});
+
+test('nextChunk holds on a zero/invalid duration', () => {
+  assert.equal(nextChunk(40e6, 10e6, 0, 26e6, 256e6, 1), 40e6);
 });
 
 test('sup maps digits to superscript glyphs', () => {

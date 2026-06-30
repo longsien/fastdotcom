@@ -53,6 +53,26 @@ function stats(xs) {
   return { min, avg: sum / xs.length, max, p90: percentile(xs, 0.9) };
 }
 
+// Turn a series of completed fine windows ({ bytes, dur } in ms) into a rolling
+// throughput series: at each window, the bps over the trailing `roll` windows
+// (~1s when roll·WINDOW ≈ 1000ms). Sampling throughput over ~1s — rather than a
+// raw 200ms window — is what a network monitor and other speed tests report, so
+// a high percentile of THIS series reflects sustained rate instead of latching
+// onto a sub-second burst. Emits only once a full roll window exists.
+function rollingBps(fine, roll) {
+  const out = [];
+  for (let i = roll - 1; i < fine.length; i++) {
+    let bytes = 0;
+    let dur = 0;
+    for (let j = i - roll + 1; j <= i; j++) {
+      bytes += fine[j].bytes;
+      dur += fine[j].dur;
+    }
+    if (dur > 0) out.push((bytes * 8) / (dur / 1000));
+  }
+  return out;
+}
+
 // Superscript "micro" digits for the inline labels above each bar.
 const SUP = { 0: '⁰', 1: '¹', 2: '²', 3: '³', 4: '⁴', 5: '⁵', 6: '⁶', 7: '⁷', 8: '⁸', 9: '⁹' };
 function sup(n) {
@@ -307,24 +327,37 @@ function httpReason(status, phase) {
 // time windows (JS is single-threaded, so the shared counters need no locking)
 // and discard the first `warmup` windows as ramp-up. Returns min/avg/max/p90.
 async function sampleThroughput(opts, worker, onTick) {
-  const { streams, window: WINDOW, warmup: WARMUP, maxDur: MAXDUR } = opts;
-  const samples = [];
+  const { streams, window: WINDOW, warmup: WARMUP, maxDur: MAXDUR, rollMs = 1000 } = opts;
+  // How many fine windows make up the ~1s rolling window the headline reports.
+  const roll = Math.max(1, Math.round(rollMs / WINDOW));
+  const fine = []; // post-warmup fine windows: { bytes, dur }
+  const fineBps = []; // their raw bps — a live fallback until 1s of data exists
   const start = performance.now();
   const ctl = { stopped: false, controller: new AbortController() };
   let winBytes = 0;
   let winStart = start;
   let widx = 0;
 
+  // Headline stats run over the rolling 1s series; before a full 1s exists, fall
+  // back to the raw fine windows so the live gauge still moves.
+  const series = () => {
+    const roll1s = rollingBps(fine, roll);
+    return stats(roll1s.length ? roll1s : fineBps);
+  };
+
   function credit(len) {
     winBytes += len;
     const now = performance.now();
     if (now - winStart >= WINDOW) {
-      const bps = (winBytes * 8) / ((now - winStart) / 1000);
-      if (widx >= WARMUP) samples.push(bps);
+      const dur = now - winStart;
+      if (widx >= WARMUP) {
+        fine.push({ bytes: winBytes, dur });
+        fineBps.push((winBytes * 8) / (dur / 1000));
+      }
       widx++;
       winBytes = 0;
       winStart = now;
-      if (onTick) onTick(stats(samples.length ? samples : [bps]));
+      if (onTick) onTick(series());
       if (now - start >= MAXDUR) {
         ctl.stopped = true;
         ctl.controller.abort();
@@ -343,35 +376,60 @@ async function sampleThroughput(opts, worker, onTick) {
   // least half a window so a tiny sliver can't divide out to a wild bps.
   const tail = performance.now() - winStart;
   if (winBytes > 0 && tail >= WINDOW / 2 && widx >= WARMUP) {
-    samples.push((winBytes * 8) / (tail / 1000));
+    fine.push({ bytes: winBytes, dur: tail });
+    fineBps.push((winBytes * 8) / (tail / 1000));
   }
 
-  const s = stats(samples);
+  const s = series();
   if (onTick) onTick(s);
   return s;
 }
 
-// Stream a sized GET repeatedly, crediting every chunk; `url(streamIdx)` lets
-// each worker hit its own fast.com target.
-function downloadWorker(url) {
+// Pick the next request size from the just-observed per-connection rate so the
+// request lasts ~targetSec. GROW-ONLY and capped: small chunks re-sample each
+// transfer's fast slow-start head and read high, so we never shrink below the
+// previous size (and never below `base`). When a request already takes longer
+// than targetSec the computed `want` falls below `prev`, so it naturally holds.
+function nextChunk(prev, bytes, secs, base, cap, targetSec) {
+  if (!(secs > 0)) return prev; // no clean timing → hold
+  const want = Math.ceil((bytes / secs) * targetSec);
+  return Math.max(base, Math.min(cap, Math.max(prev, want)));
+}
+
+// Stream sized GETs repeatedly, crediting every chunk; `target(streamIdx)` lets
+// each worker hit its own fast.com target. The request size adapts upward on
+// fast per-connection links (see nextChunk) so we measure sustained throughput
+// rather than repeatedly catching transfers' fast starts.
+function downloadWorker(target, ranged, base, cap) {
+  const TARGET_SEC = 1; // aim for ~1s per request
   return async ({ idx, credit, ctl, elapsed, maxDur }) => {
+    let chunk = base;
     while (!ctl.stopped && elapsed() < maxDur) {
+      const t0 = performance.now();
+      let got = 0;
+      let full = true;
       let res;
       try {
-        res = await fetch(url(idx), { signal: ctl.controller.signal, cache: 'no-store' });
+        res = await fetch(ranged(target(idx), chunk), { signal: ctl.controller.signal, cache: 'no-store' });
       } catch (e) {
         if (e.name === 'AbortError') return;
         throw e;
       }
       if (!res.ok) throw new Error(httpReason(res.status, 'download'));
       try {
-        for await (const chunk of res.body) {
-          credit(chunk.length);
-          if (ctl.stopped) break;
+        for await (const c of res.body) {
+          credit(c.length);
+          got += c.length;
+          if (ctl.stopped) { full = false; break; }
         }
       } catch (e) {
         if (e.name !== 'AbortError') throw e;
+        full = false;
       }
+      // Only re-size off a request that fully completed — an aborted tail has no
+      // clean rate, and on a slow link the deadline fires mid-request so the
+      // size correctly stays at `base`.
+      if (full && got > 0) chunk = nextChunk(chunk, got, (performance.now() - t0) / 1000, base, cap, TARGET_SEC);
     }
   };
 }
@@ -509,10 +567,18 @@ function makeFastCom() {
     },
     async download(onTick) {
       await ensure();
-      const CHUNK = 26e6;
+      const BASE = 26e6; // request size floor — already sustained on normal links
+      const CAP = 256e6; // ceiling for very fast per-connection links
+      // Open several connections PER target. The Open Connect OCAs sit ~15-20ms
+      // out, so a single TCP stream each is window/RTT-limited and under-fills a
+      // high-bandwidth link; parallelising multiplies aggregate throughput (and
+      // the data used) until it saturates. 4×targets matches what fast.com's own
+      // site pulls on a fast connection.
+      const PER = 4;
+      const streams = targets.length * PER;
       return sampleThroughput(
-        { streams: targets.length, window: 200, warmup: 2, maxDur: 6000 },
-        downloadWorker((idx) => ranged(targets[idx], CHUNK)),
+        { streams, window: 200, warmup: 2, maxDur: 6000 },
+        downloadWorker((idx) => targets[idx % targets.length], ranged, BASE, CAP),
         onTick
       );
     },
@@ -527,7 +593,12 @@ function makeFastCom() {
       await ensure();
       const buf = Buffer.alloc(64 * 1024);
       const CHUNK = 400 * buf.length; // 25 MiB, exact multiple of buf
-      const streams = Math.min(4, targets.length); // modest load → closer to real
+      // 8 streams is the measured sweet spot: wire-accurate upload peaks at
+      // ~8-16 connections, but the send-side reading's over-read climbs with
+      // parallelism (1.06× at 8, 1.6× at 24). 8 keeps near-peak real throughput
+      // at the lowest over-read; piling on more inflates the figure, not the
+      // bytes that actually reach the server.
+      const streams = Math.min(8, targets.length * 2);
       return sampleThroughput(
         { streams, window: 200, warmup: 3, maxDur: 6500 },
         async ({ idx, credit, ctl, elapsed, maxDur }) => {
@@ -988,5 +1059,5 @@ if (require.main === module) {
     process.exit(1);
   });
 } else {
-  module.exports = { makeTui, gaugeStats, labelRow, stats, sup, fmtBits, fmtMs, median, percentile };
+  module.exports = { makeTui, gaugeStats, labelRow, stats, sup, fmtBits, fmtMs, median, percentile, rollingBps, nextChunk };
 }
