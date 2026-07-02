@@ -35,8 +35,6 @@ fast --version       # print the version
 fast --help          # all options
 ```
 
-That's it. No account, no config, no tracking.
-
 ## License
 
 [MIT](LICENSE) © Long Sien
