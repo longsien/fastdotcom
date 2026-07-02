@@ -26,10 +26,13 @@ brew install longsien/tap/fast
 ## Usage
 
 ```sh
-fast              # run a full speed test
-fast --no-upload  # skip the upload test
-fast --json       # print results as JSON
-fast --help       # all options
+fast                 # run a full speed test
+fast --no-upload     # skip the upload test
+fast --json          # print results as JSON
+fast --duration 10   # measure each direction for 10s (3-30, default ~6)
+fast --no-tui        # plain line output (auto when piped or NO_COLOR is set)
+fast --version       # print the version
+fast --help          # all options
 ```
 
 That's it. No account, no config, no tracking.

@@ -15,8 +15,10 @@ const https = require('node:https');
 
 function fmtBits(bitsPerSec) {
   const mbps = bitsPerSec / 1e6;
-  if (mbps >= 1000) return (mbps / 1000).toFixed(2) + ' Gbps';
-  if (mbps < 1) return (bitsPerSec / 1e3).toFixed(0) + ' kbps';
+  // Unit thresholds sit where toFixed rounds up, so 999.96 Mbps prints as
+  // "1.00 Gbps" rather than "1000.0 Mbps" (and likewise at the kbps edge).
+  if (mbps >= 999.95) return (mbps / 1000).toFixed(2) + ' Gbps';
+  if (mbps < 0.9995) return (bitsPerSec / 1e3).toFixed(0) + ' kbps';
   return mbps.toFixed(1) + ' Mbps';
 }
 
@@ -100,22 +102,30 @@ async function detectLightBg() {
     stdin.resume();
 
     let buf = '';
-    let settled = false;
+    let resolved = false;
+    let cleaned = false;
+    let drain = null;
     const onData = (chunk) => { buf += chunk.toString(); };
     stdin.on('data', onData);
 
     // Send OSC 11 query (request background colour).
     process.stdout.write('\x1b]11;?\x07');
 
-    const done = (light) => {
-      if (settled) return;
-      settled = true;
+    const finish = (light) => {
+      if (resolved) return;
+      resolved = true;
+      resolve(light);
+    };
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
       clearInterval(poll);
       clearTimeout(timer);
+      clearTimeout(drain);
       stdin.removeListener('data', onData);
       stdin.setRawMode(prevRaw);
       stdin.pause();
-      resolve(light);
+      finish(false);
     };
 
     const check = () => {
@@ -124,11 +134,18 @@ async function detectLightBg() {
         const r = parseInt(m[1], 16) >> (m[1].length > 2 ? 8 : 0);
         const g = parseInt(m[2], 16) >> (m[2].length > 2 ? 8 : 0);
         const b = parseInt(m[3], 16) >> (m[3].length > 2 ? 8 : 0);
-        done(0.299 * r + 0.587 * g + 0.114 * b > 128);
+        finish(0.299 * r + 0.587 * g + 0.114 * b > 128);
+        cleanup();
       }
     };
     const poll = setInterval(check, 10);
-    const timer = setTimeout(() => done(false), 150);
+    // No reply by the deadline: assume dark and get going, but keep draining
+    // stdin briefly — over a slow link (SSH) the reply can arrive late, and
+    // once we stop reading it would leak into the shell as garbage keystrokes.
+    const timer = setTimeout(() => {
+      finish(false);
+      drain = setTimeout(cleanup, 400);
+    }, 250);
   });
 }
 
@@ -221,18 +238,29 @@ function gaugeStats(st, width, stops, scaleMax) {
   const fill = Math.round(Math.min(1, st.p90 / max) * width);
   const minIdx = clampIdx(Math.min(1, st.min / max), width);
   const maxIdx = clampIdx(Math.min(1, st.max / max), width);
+  // Emit a colour code only when it changes — long same-colour runs (the dim
+  // track especially) collapse to one SGR instead of one per character, which
+  // shrinks each repaint several-fold on slow terminals/SSH.
   let out = '';
+  let last = null;
+  const put = (color, ch) => {
+    if (color !== last) {
+      out += color;
+      last = color;
+    }
+    out += ch;
+  };
   for (let i = 0; i < width; i++) {
     if (i === minIdx) {
-      out += C_TICK() + DOT; // bright min marker
+      put(C_TICK(), DOT); // bright min marker
     } else if (i < fill) {
       const t = width > 1 ? i / (width - 1) : 0;
       const [r, g, b] = gradColor(stops, t);
-      out += fg(r, g, b) + DOT;
+      put(fg(r, g, b), DOT);
     } else if (i === maxIdx) {
-      out += C_MAXTICK() + DOT; // faint max marker in the track
+      put(C_MAXTICK(), DOT); // faint max marker in the track
     } else {
-      out += C_TRACK() + DOT;
+      put(C_TRACK(), DOT);
     }
   }
   return out + RESET;
@@ -254,8 +282,18 @@ function place(cells, text, idx, align, color) {
   for (let i = 0; i < len; i++) cells[start + i] = { ch: text[i], color };
 }
 function renderCells(cells) {
+  // Same run-coalescing as gaugeStats: repeat a colour code only on change.
+  // Spaces render identically under any foreground, so they don't break a run.
   let out = '';
-  for (const c of cells) out += c.color && c.ch !== ' ' ? c.color + c.ch : c.ch;
+  let last = null;
+  for (const c of cells) {
+    const color = c.ch !== ' ' ? c.color : null;
+    if (color && color !== last) {
+      out += color;
+      last = color;
+    }
+    out += c.ch;
+  }
   return out + RESET;
 }
 
@@ -321,13 +359,26 @@ function httpReason(status, phase) {
   return `${phase} failed: HTTP ${status}`;
 }
 
+// fetch with a deadline and a readable timeout message. The bulk-transfer
+// paths manage their own AbortController (plus the sampler's watchdog); this
+// covers the small one-shot requests — discovery and latency probes — that
+// would otherwise hang forever on a stalled connection.
+async function timedFetch(url, ms, what, init) {
+  try {
+    return await fetch(url, { ...init, signal: AbortSignal.timeout(ms) });
+  } catch (e) {
+    if (e.name === 'TimeoutError') throw new Error(`${what} timed out`);
+    throw e;
+  }
+}
+
 // Generic parallel-throughput sampler. Runs `streams` worker loops in parallel;
 // each worker repeatedly transfers data and calls `credit(bytes)` for every
 // chunk/request. We aggregate credited bytes across ALL workers into fixed
 // time windows (JS is single-threaded, so the shared counters need no locking)
 // and discard the first `warmup` windows as ramp-up. Returns min/avg/max/p90.
 async function sampleThroughput(opts, worker, onTick) {
-  const { streams, window: WINDOW, warmup: WARMUP, maxDur: MAXDUR, rollMs = 1000 } = opts;
+  const { streams, window: WINDOW, warmup: WARMUP, maxDur: MAXDUR, rollMs = 1000, label = 'transfer' } = opts;
   // How many fine windows make up the ~1s rolling window the headline reports.
   const roll = Math.max(1, Math.round(rollMs / WINDOW));
   const fine = []; // post-warmup fine windows: { bytes, dur }
@@ -366,11 +417,27 @@ async function sampleThroughput(opts, worker, onTick) {
   }
   const elapsed = () => performance.now() - start;
 
-  await Promise.all(
+  // Watchdog: credit() enforces maxDur only while data is flowing, so a fully
+  // stalled connection would otherwise hang the run forever (the workers block
+  // in a body read / drain wait that only ends on abort). Fires a beat after
+  // the deadline so the normal in-band shutdown wins whenever data moves.
+  let watchdogFired = false;
+  const watchdog = setTimeout(() => {
+    watchdogFired = true;
+    ctl.stopped = true;
+    ctl.controller.abort();
+  }, MAXDUR + 500);
+
+  // allSettled, not all: one stream dying (a reset, a stray 429) mustn't throw
+  // away an otherwise-valid measurement — the surviving streams keep sampling.
+  // Only if EVERY stream failed is the reading meaningless; then surface the
+  // first real error.
+  const results = await Promise.allSettled(
     Array.from({ length: streams }, (_, idx) =>
       worker({ idx, credit, ctl, elapsed, maxDur: MAXDUR })
     )
   );
+  clearTimeout(watchdog);
 
   // Record the final partial window so a short tail isn't dropped. Require at
   // least half a window so a tiny sliver can't divide out to a wild bps.
@@ -380,8 +447,12 @@ async function sampleThroughput(opts, worker, onTick) {
     fineBps.push((winBytes * 8) / (tail / 1000));
   }
 
+  const failures = results.filter((r) => r.status === 'rejected');
+  if (failures.length === results.length && failures.length) throw failures[0].reason;
+
   const s = series();
   if (onTick) onTick(s);
+  if (!s && watchdogFired) throw new Error(`${label} stalled: no data received`);
   return s;
 }
 
@@ -510,14 +581,16 @@ function makeFastCom() {
   let client = null;
 
   async function discover() {
-    const home = await (await fetch('https://fast.com/')).text();
+    const home = await (await timedFetch('https://fast.com/', 10000, 'fast.com discovery')).text();
     const sm = home.match(/<script src="(\/app-[^"]+\.js)"/);
     if (!sm) throw new Error('fast.com: app bundle not found');
-    const js = await (await fetch('https://fast.com' + sm[1])).text();
+    const js = await (await timedFetch('https://fast.com' + sm[1], 10000, 'fast.com discovery')).text();
     const tm = js.match(/token:"([^"]+)"/);
     if (!tm) throw new Error('fast.com: token not found');
-    const res = await fetch(
-      `https://api.fast.com/netflix/speedtest/v2?https=true&token=${tm[1]}&urlCount=5`
+    const res = await timedFetch(
+      `https://api.fast.com/netflix/speedtest/v2?https=true&token=${tm[1]}&urlCount=5`,
+      10000,
+      'fast.com discovery'
     );
     if (!res.ok) throw new Error(httpReason(res.status, 'fast.com discovery'));
     const data = await res.json();
@@ -553,10 +626,15 @@ function makeFastCom() {
     async latency(samples, onTick) {
       await ensure();
       const url = ranged(targets[0], 0); // one target so the connection is reused
+      // Untimed warm-up: the first request pays DNS + TCP + TLS setup, which
+      // would otherwise inflate max/avg (and jitter, computed off the mean).
+      await timedFetch(url, 5000, 'latency probe', { cache: 'no-store' })
+        .then((r) => r.arrayBuffer())
+        .catch(() => {}); // a failed warm-up just means no pre-warm; probes still run
       const times = [];
       for (let i = 0; i < samples; i++) {
         const t0 = performance.now();
-        const res = await fetch(url, { cache: 'no-store' });
+        const res = await timedFetch(url, 5000, 'latency probe', { cache: 'no-store' });
         await res.arrayBuffer();
         times.push(performance.now() - t0);
         if (onTick) onTick(stats(times));
@@ -565,7 +643,7 @@ function makeFastCom() {
       const jitter = median(times.map((t) => Math.abs(t - s.avg)));
       return { stats: s, jitter };
     },
-    async download(onTick) {
+    async download(onTick, maxDur) {
       await ensure();
       const BASE = 26e6; // request size floor — already sustained on normal links
       const CAP = 256e6; // ceiling for very fast per-connection links
@@ -577,7 +655,7 @@ function makeFastCom() {
       const PER = 4;
       const streams = targets.length * PER;
       return sampleThroughput(
-        { streams, window: 200, warmup: 2, maxDur: 6000 },
+        { streams, window: 200, warmup: 2, maxDur: maxDur || 6000, label: 'download' },
         downloadWorker((idx) => targets[idx % targets.length], ranged, BASE, CAP),
         onTick
       );
@@ -589,7 +667,7 @@ function makeFastCom() {
     // that the reading still runs high and scales with offered load — so we use
     // a deliberately modest config and flag it approximate (see `approx`).
     approxUpload: true,
-    async upload(onTick) {
+    async upload(onTick, maxDur) {
       await ensure();
       const buf = Buffer.alloc(64 * 1024);
       const CHUNK = 400 * buf.length; // 25 MiB, exact multiple of buf
@@ -600,7 +678,7 @@ function makeFastCom() {
       // bytes that actually reach the server.
       const streams = Math.min(8, targets.length * 2);
       return sampleThroughput(
-        { streams, window: 200, warmup: 3, maxDur: 6500 },
+        { streams, window: 200, warmup: 3, maxDur: maxDur ? maxDur + 500 : 6500, label: 'upload' },
         async ({ idx, credit, ctl, elapsed, maxDur }) => {
           const url = ranged(targets[idx % targets.length], CHUNK);
           while (!ctl.stopped && elapsed() < maxDur) {
@@ -685,17 +763,37 @@ function makeTui(doUpload) {
     mix(T.shimmerBase, T.shimmerGlow, sweepK(col) * gain);
 
   // A run of `count` identical border chars from column `startCol`, swept.
+  // When the shimmer is idle every column is the resting colour, so the whole
+  // run is one SGR + repeat; while sweeping, coalesce equal-colour neighbours.
   function borderRun(ch, count, startCol) {
+    if (count <= 0) return '';
+    if (shimmer == null) return fg(...T.shimmerBase) + ch.repeat(count) + RESET;
     let s = '';
-    for (let i = 0; i < count; i++) s += borderColor(startCol + i) + ch;
+    let last = null;
+    for (let i = 0; i < count; i++) {
+      const c = borderColor(startCol + i);
+      if (c !== last) {
+        s += c;
+        last = c;
+      }
+      s += ch;
+    }
     return s + RESET;
   }
 
   // Muted header/footer text (location, IP) that also catches the sweep.
   function sweptText(text, startCol) {
+    if (shimmer == null) return fg(...T.shimmerText) + text + RESET;
     let s = '';
-    for (let i = 0; i < text.length; i++)
-      s += mix(T.shimmerText, T.shimmerTextGlow, sweepK(startCol + i)) + text[i];
+    let last = null;
+    for (let i = 0; i < text.length; i++) {
+      const c = mix(T.shimmerText, T.shimmerTextGlow, sweepK(startCol + i));
+      if (c !== last) {
+        s += c;
+        last = c;
+      }
+      s += text[i];
+    }
     return s + RESET;
   }
 
@@ -913,12 +1011,13 @@ async function runTui(opts) {
     tui.state.pingStats = ping.stats;
     tui.state.jitter = ping.jitter;
 
+    const durMs = opts.duration ? opts.duration * 1000 : undefined;
     tui.state.phase = 'down';
     tui.paint(true);
     tui.state.downStats = await session.download((st) => {
       tui.state.downStats = st;
       tui.paint();
-    });
+    }, durMs);
     tui.state.provider = session.name(); // may have failed over mid-run
 
     if (opts.upload) {
@@ -927,7 +1026,7 @@ async function runTui(opts) {
       tui.state.upStats = await session.upload((st) => {
         tui.state.upStats = st;
         tui.paint();
-      });
+      }, durMs);
       tui.state.provider = session.name();
       if (!tui.state.upStats) tui.state.upUnavailable = true; // provider can't measure it
       tui.state.uploadApprox = session.uploadApprox();
@@ -959,11 +1058,35 @@ function speedRange(st, fmt) {
 
 async function runPlain(opts) {
   const session = makeSession();
+  const durMs = opts.duration ? opts.duration * 1000 : undefined;
+  // Non-JSON plain output prints each line as its phase completes, so an
+  // interactive `--no-tui` run isn't silent for the whole ~15 seconds. JSON
+  // stays a single document emitted at the end.
+  const say = opts.json ? () => {} : (line) => console.log(line);
+
   const meta = await session.getMeta().catch(() => null);
+  if (meta) {
+    const where = [meta.colo, meta.country].filter(Boolean).join(' · ');
+    say(`Testing via ${session.name()}${where ? ' ' + where : ''}`);
+  }
 
   const ping = await session.latency(12);
-  const down = await session.download();
-  const up = opts.upload ? await session.upload() : null;
+  if (ping.stats)
+    say(`  latency  ${range(ping.stats, fmtMs)}  jitter ${fmtMs(ping.jitter)}`);
+
+  const down = await session.download(undefined, durMs);
+  if (down) say(`  download ${speedRange(down, fmtBits)}`);
+
+  const up = opts.upload ? await session.upload(undefined, durMs) : null;
+  if (up) {
+    const tags = [];
+    if (session.uploadName() !== session.name()) tags.push(`via ${session.uploadName()}`);
+    if (session.uploadApprox()) tags.push('approx');
+    const suffix = tags.length ? `  (${tags.join(', ')})` : '';
+    say(`  upload   ${speedRange(up, fmtBits)}${suffix}`);
+  } else if (opts.upload) {
+    say(`  upload   unavailable (no usable backend for this connection)`);
+  }
 
   if (opts.json) {
     const pack = (s) =>
@@ -988,40 +1111,46 @@ async function runPlain(opts) {
         2
       )
     );
-    return;
   }
-
-  const out = [];
-  if (meta) {
-    const where = [meta.colo, meta.country].filter(Boolean).join(' · ');
-    out.push(`Testing via ${session.name()}${where ? ' ' + where : ''}`);
-  }
-  if (ping.stats)
-    out.push(`  latency  ${range(ping.stats, fmtMs)}  jitter ${fmtMs(ping.jitter)}`);
-  if (down) out.push(`  download ${speedRange(down, fmtBits)}`);
-  if (up) {
-    const tags = [];
-    if (session.uploadName() !== session.name()) tags.push(`via ${session.uploadName()}`);
-    if (session.uploadApprox()) tags.push('approx');
-    const suffix = tags.length ? `  (${tags.join(', ')})` : '';
-    out.push(`  upload   ${speedRange(up, fmtBits)}${suffix}`);
-  } else if (opts.upload) {
-    out.push(`  upload   unavailable (no usable backend for this connection)`);
-  }
-  console.log(out.join('\n'));
 }
 
 // ---- entry -----------------------------------------------------------------
 
 function parseArgs(argv) {
-  const opts = { json: false, upload: true, tui: true };
-  for (const a of argv) {
+  // tui is tri-state: 'auto' picks TUI only on a truecolor-capable TTY (see
+  // tuiCapable); --tui / --no-tui force it. duration is seconds per direction.
+  const opts = { json: false, upload: true, tui: 'auto', duration: null };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
     if (a === '--json') opts.json = true;
     else if (a === '--no-upload') opts.upload = false;
     else if (a === '--no-tui') opts.tui = false;
+    else if (a === '--tui') opts.tui = true;
     else if (a === '-h' || a === '--help') opts.help = true;
+    else if (a === '-v' || a === '--version') opts.version = true;
+    else if (a === '--duration' || a.startsWith('--duration=')) {
+      const v = a.includes('=') ? a.slice('--duration='.length) : argv[++i];
+      const n = Number(v);
+      if (!v || !Number.isFinite(n) || n < 3 || n > 30)
+        throw new Error(`--duration wants seconds between 3 and 30 (got ${v ?? 'nothing'})`);
+      opts.duration = n;
+    } else throw new Error(`unknown option '${a}' (try --help)`);
   }
   return opts;
+}
+
+// Whether the TUI can render: it's drawn entirely in 24-bit colour, so beyond
+// a TTY we want no NO_COLOR (https://no-color.org — any non-empty value wins),
+// a real terminal, and a truecolor hint. Without one the gradients would come
+// out as approximated or garbled colours — plain output is the honest fallback
+// (--tui still forces it for terminals that support truecolor but don't say so).
+function tuiCapable(env, isTTY) {
+  if (!isTTY) return false;
+  if (env.NO_COLOR) return false;
+  if (env.TERM === 'dumb') return false;
+  if (/truecolor|24bit/i.test(env.COLORTERM || '')) return true;
+  if (/-direct/.test(env.TERM || '')) return true;
+  return false;
 }
 
 function help() {
@@ -1037,17 +1166,35 @@ Ping is shown as a number.
 Upload uses a send-side measurement and reads on the high side (shown ~approx).
 
 Options:
-  --json        Output results as JSON (implies plain output)
-  --no-upload   Skip the upload test
-  --no-tui      Force plain line output instead of the TUI
-  -h, --help    Show this help`);
+  --json           Output results as JSON (implies plain output)
+  --no-upload      Skip the upload test
+  --duration <s>   Seconds per direction, 3-30 (default ~6)
+  --tui            Force the TUI (auto-picked on truecolor terminals)
+  --no-tui         Force plain line output instead of the TUI
+  -v, --version    Print the version
+  -h, --help       Show this help
+
+Respects NO_COLOR: when set (or the terminal lacks truecolor support), output
+falls back to plain lines.`);
 }
 
 async function main() {
+  // Piping into e.g. `head` closes stdout early; without this the write fails
+  // with an unhandled EPIPE stack trace instead of a quiet exit.
+  process.stdout.on('error', (e) => {
+    if (e && e.code === 'EPIPE') process.exit(0);
+    throw e;
+  });
+
   const opts = parseArgs(process.argv.slice(2));
   if (opts.help) return help();
+  if (opts.version) return console.log(require('./package.json').version);
 
-  const useTui = opts.tui && !opts.json && process.stdout.isTTY;
+  const useTui =
+    !opts.json &&
+    process.stdout.isTTY &&
+    opts.tui !== false &&
+    (opts.tui === true || tuiCapable(process.env, true));
   if (useTui) await runTui(opts);
   else await runPlain(opts);
 }
@@ -1059,5 +1206,5 @@ if (require.main === module) {
     process.exit(1);
   });
 } else {
-  module.exports = { makeTui, gaugeStats, labelRow, stats, sup, fmtBits, fmtMs, median, percentile, rollingBps, nextChunk };
+  module.exports = { makeTui, gaugeStats, labelRow, stats, sup, fmtBits, fmtMs, median, percentile, rollingBps, nextChunk, parseArgs, tuiCapable, sampleThroughput };
 }

@@ -9,6 +9,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
+  makeTui,
   gaugeStats,
   labelRow,
   stats,
@@ -19,6 +20,9 @@ const {
   percentile,
   rollingBps,
   nextChunk,
+  parseArgs,
+  tuiCapable,
+  sampleThroughput,
 } = require('./index.js');
 
 // Visible width with ANSI escape sequences stripped (mirrors index.js).
@@ -35,6 +39,12 @@ test('fmtBits picks units across the kbps/Mbps/Gbps boundaries', () => {
   assert.equal(fmtBits(999e6), '999.0 Mbps'); // just under the Gbps switch
   assert.equal(fmtBits(1e9), '1.00 Gbps'); // 1000 Mbps → Gbps
   assert.equal(fmtBits(2.5e9), '2.50 Gbps');
+});
+
+test('fmtBits rounds before picking a unit at the kbps/Mbps/Gbps boundaries', () => {
+  assert.equal(fmtBits(999.96e6), '1.00 Gbps'); // not "1000.0 Mbps"
+  assert.equal(fmtBits(999.6e3), '1.0 Mbps'); // not "1000 kbps"
+  assert.equal(fmtBits(999.4e3), '999 kbps'); // still below the round-up point
 });
 
 test('fmtMs keeps one decimal place', () => {
@@ -144,9 +154,138 @@ test('gaugeStats fill grows with the p90 relative to scaleMax', () => {
   const hi = stats([90]); // p90 90
   const scale = 100;
   // Unfilled cells are the dim track colour C_TRACK = fg(48,52,64). A higher
-  // p90 fills more of the bar, leaving fewer track cells behind.
-  const trackCells = (s) => (s.match(/\x1b\[38;2;48;52;64m/g) || []).length;
+  // p90 fills more of the bar, leaving fewer track cells behind. Colour codes
+  // are run-coalesced, so count dots under the active colour, not SGRs.
+  const trackCells = (s) => {
+    const re = /(\x1b\[[0-9;]*m)|(⠿)/g;
+    let cur = '';
+    let n = 0;
+    let m;
+    while ((m = re.exec(s))) {
+      if (m[1]) cur = m[1];
+      else if (cur === '\x1b[38;2;48;52;64m') n++;
+    }
+    return n;
+  };
   assert.ok(trackCells(gaugeStats(hi, 40, G, scale)) < trackCells(gaugeStats(lo, 40, G, scale)));
+});
+
+test('gaugeStats coalesces same-colour runs into one escape sequence', () => {
+  // p90 = 10 on a 0-100 scale fills 4 of 40 columns; the remaining ~35 track
+  // cells share one colour, so the track SGR should be emitted exactly once.
+  const out = gaugeStats(stats([10]), 40, G, 100);
+  const trackSeqs = (out.match(/38;2;48;52;64/g) || []).length;
+  assert.equal(trackSeqs, 1);
+});
+
+test('parseArgs rejects unknown options', () => {
+  assert.throws(() => parseArgs(['--jsn']), /unknown option '--jsn'/);
+  assert.throws(() => parseArgs(['-x']), /unknown option/);
+});
+
+test('parseArgs understands --version and -v', () => {
+  assert.equal(parseArgs(['--version']).version, true);
+  assert.equal(parseArgs(['-v']).version, true);
+  assert.ok(!parseArgs([]).version);
+});
+
+test('parseArgs parses --duration in both forms and validates the range', () => {
+  assert.equal(parseArgs(['--duration', '10']).duration, 10);
+  assert.equal(parseArgs(['--duration=10']).duration, 10);
+  assert.equal(parseArgs([]).duration, null);
+  assert.throws(() => parseArgs(['--duration', '2']), /--duration/);
+  assert.throws(() => parseArgs(['--duration', '31']), /--duration/);
+  assert.throws(() => parseArgs(['--duration', 'abc']), /--duration/);
+  assert.throws(() => parseArgs(['--duration']), /--duration/);
+});
+
+test('parseArgs keeps tui tri-state: auto by default, forced by --tui/--no-tui', () => {
+  assert.equal(parseArgs([]).tui, 'auto');
+  assert.equal(parseArgs(['--tui']).tui, true);
+  assert.equal(parseArgs(['--no-tui']).tui, false);
+});
+
+test('tuiCapable requires a TTY, no NO_COLOR, and a truecolor hint', () => {
+  assert.equal(tuiCapable({ COLORTERM: 'truecolor' }, true), true);
+  assert.equal(tuiCapable({ COLORTERM: '24bit' }, true), true);
+  assert.equal(tuiCapable({ TERM: 'xterm-direct' }, true), true);
+  assert.equal(tuiCapable({ COLORTERM: 'truecolor' }, false), false); // not a TTY
+  assert.equal(tuiCapable({ COLORTERM: 'truecolor', NO_COLOR: '1' }, true), false);
+  assert.equal(tuiCapable({ COLORTERM: 'truecolor', NO_COLOR: '' }, true), true); // empty = unset per spec
+  assert.equal(tuiCapable({ TERM: 'dumb', COLORTERM: 'truecolor' }, true), false);
+  assert.equal(tuiCapable({ TERM: 'xterm-256color' }, true), false); // no truecolor hint
+});
+
+test('sampleThroughput aborts a stalled run instead of hanging forever', async () => {
+  // A worker that never delivers a byte and only ends when aborted. Without a
+  // watchdog this hangs: the maxDur check lives in credit(), which never runs.
+  const stalled = ({ ctl }) =>
+    new Promise((res) => ctl.controller.signal.addEventListener('abort', () => res(), { once: true }));
+  const run = assert.rejects(
+    sampleThroughput({ streams: 1, window: 50, warmup: 0, maxDur: 100, label: 'download' }, stalled),
+    /download stalled/
+  );
+  const hung = new Promise((res) => setTimeout(() => res('hung'), 3000));
+  assert.notEqual(await Promise.race([run.then(() => 'done'), hung]), 'hung');
+});
+
+test('sampleThroughput tolerates one dead stream when others deliver', async () => {
+  const worker = async ({ idx, credit, ctl, elapsed, maxDur }) => {
+    if (idx === 0) throw new Error('stream 0 reset');
+    while (!ctl.stopped && elapsed() < maxDur) {
+      credit(1e6);
+      await new Promise((r) => setTimeout(r, 5));
+    }
+  };
+  const s = await sampleThroughput({ streams: 2, window: 20, warmup: 0, maxDur: 150 }, worker);
+  assert.ok(s && s.avg > 0);
+});
+
+test('sampleThroughput still fails when every stream errors', async () => {
+  await assert.rejects(
+    sampleThroughput({ streams: 2, window: 20, warmup: 0, maxDur: 200 }, async () => {
+      throw new Error('boom');
+    }),
+    /boom/
+  );
+});
+
+test('TUI frames keep every line the same visible width (shimmer and idle paths)', () => {
+  // Exercises the coalesced border/shimmer renderers end-to-end: capture two
+  // painted frames (one mid-run with the sweep active, one done/idle) and
+  // check every box line is exactly the same visible width.
+  const tui = makeTui(true);
+  const writes = [];
+  const orig = process.stdout.write;
+  process.stdout.write = (s) => {
+    writes.push(s);
+    return true;
+  };
+  try {
+    tui.state.meta = { clientIp: '203.0.113.7', colo: 'Melbourne', country: 'AU', city: 'Melbourne' };
+    tui.state.provider = 'fast.com';
+    tui.state.pingStats = stats([12, 14, 20]);
+    tui.state.jitter = 1.2;
+    tui.state.downStats = stats([600e6, 700e6, 710e6]);
+    tui.state.phase = 'down'; // busy → shimmer sweep active
+    tui.paint(true);
+    tui.state.phase = 'done'; // idle → single-colour fast paths
+    tui.paint(true);
+  } finally {
+    process.stdout.write = orig;
+  }
+  // Each paint() flushes one frame in a single write; check them separately
+  // (the second frame starts with cursor-up codes to overwrite the first).
+  assert.equal(writes.length, 2);
+  for (const frame of writes) {
+    const lines = frame
+      .split('\n')
+      .map((l) => l.replace(/\r|\x1b\[[0-9;]*[A-Za-z]/g, '')) // strip CSI + carriage returns
+      .filter((l) => l.length > 0);
+    assert.ok(lines.length >= 10, `expected a full frame, got ${lines.length} lines`);
+    const widths = new Set(lines.map((l) => l.length));
+    assert.equal(widths.size, 1, `line widths differ: ${[...widths].join(', ')}`);
+  }
 });
 
 test('labelRow stays exactly `width` columns wide', () => {
